@@ -18,18 +18,15 @@ from zhangnowcast.data.zhang_buckets_from_vintages import (
     list_vintages,
     pick_vintage_for_month_q,
 )
-from zhangnowcast.data.zhang_xq_builder import make_Xq_for_month  # noqa: F401 (kept for future)
 from zhangnowcast.inference.sampler import run_bay
 from zhangnowcast.results.io import init_run_dir, finalize_run_dir, save_subrun_outputs
 
 
-# paste this into terminal:
-# nohup /usr/local/bin/python3 "/path/to/scripts/run_withmoreresults.py" > run_full.log 2>&1 &
+# =============================================================================
+# CONFIG (edit here)
+# =============================================================================
 
-
-# CONFIG (no argparse; edit values here)
-
-MODEL_TYPES = ["bay_sv"]  # ["bay"] or ["bay_sv"] or both
+MODEL_TYPES = ["bay", "bay_sv"]  # ["bay"] or ["bay_sv"] or both
 
 DATA_DIR_REL = Path("data/NL")
 SPEC_FILE_REL = Path("data/Spec_NL.xlsx")
@@ -37,8 +34,9 @@ SPEC_FILE_REL = Path("data/Spec_NL.xlsx")
 CACHE_DIR_REL = Path("output/replication")
 RESULTS_DIR_REL = Path("outputs")
 
-VINTAGE_START = "2024-10-01"
-VINTAGE_END = "2025-11-14"
+# Long horizon
+VINTAGE_START = "2015-01-01"
+VINTAGE_END = "2025-11-14"   
 
 GDP_SERIES_ID = "Real GDP"
 SAMPLE_START = "2002-01-01"
@@ -60,20 +58,26 @@ SAVE_DRAWS = True
 RESUME = True
 DEBUG = False
 
-do_selection = False  # currently not used; kept for easy toggling
+do_selection = False  
+
+# -------------------------------------------------------------------------
+# NEW: choose frequency of *saved* nowcasts
+#
+#   RUN_MODE="eom" -> 1 nowcast per month (end-of-month snapshot)
+#   RUN_MODE="eoq" -> 1 nowcast per quarter (end-of-quarter snapshot; month 3 only)
+#
+# We implement this by selecting months, and fixing q=3 (last release in month).
+# -------------------------------------------------------------------------
+RUN_MODE = "eom"   # "eom" or "eoq"
+Q_FIXED = 3        # end-of-month / last-release snapshot
 
 
+# =============================================================================
 # Path / IO helpers
+# =============================================================================
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
-
-
-def _dbg(tag, D):
-    last_date = pd.to_datetime(D.dates_m[-1]).date()
-    last_obs = int(np.sum(~np.isnan(D.X_m[-1, :])))
-    sec_obs = int(np.sum(~np.isnan(D.X_m[-2, :]))) if D.X_m.shape[0] >= 2 else -1
-    print(f"DEBUG {tag}: last_date={last_date} last_obs={last_obs} second_last_obs={sec_obs}")
 
 
 def have_xlrd() -> bool:
@@ -155,12 +159,10 @@ def model_use_sv(model_type: str) -> bool:
     raise ValueError(f"Unknown MODEL_TYPE '{model_type}' (expected 'bay' or 'bay_sv').")
 
 
-# Core correctness helper: TRIM to month_T
-
 def trim_data_to_month_T(D, month_T: pd.Timestamp):
     """
     Ensure the monthly panel ends at month_T (inclusive).
-    This is critical: 'T' defines the end of the information set in Zhang.
+    This is critical: 'T' defines the end of the information set.
     """
     month_T = pd.to_datetime(month_T).normalize().replace(day=1)
     dm = pd.to_datetime(D.dates_m).normalize()
@@ -183,21 +185,20 @@ def month_in_quarter(month_T: pd.Timestamp) -> int:
     return ((m - 1) % 3) + 1
 
 
-def _pick_log_row(now_rows: list[dict]) -> dict:
-    """
-    For printing progress:
-    Prefer the row whose target_quarter == asof_quarter (within-quarter nowcast),
-    else fall back to the last target row.
-    """
-    if not now_rows:
-        return {}
-    for r in now_rows:
-        if bool(r.get("asof_in_target", False)):
-            return r
-    return now_rows[-1]
+def pick_months(start: pd.Timestamp, end: pd.Timestamp, run_mode: str) -> list[pd.Timestamp]:
+    start_month = start.normalize().replace(day=1)
+    end_month = end.normalize().replace(day=1)
+    months_all = list(pd.date_range(start_month, end_month, freq="MS"))
+    if run_mode.lower().strip() == "eom":
+        return months_all
+    if run_mode.lower().strip() == "eoq":
+        return [m for m in months_all if month_in_quarter(m) == 3]
+    raise ValueError("RUN_MODE must be 'eom' or 'eoq'")
 
 
+# =============================================================================
 # Main
+# =============================================================================
 
 def main():
     root = project_root()
@@ -212,12 +213,10 @@ def main():
     if not vintages:
         raise RuntimeError(f"No vintage files found in {vintage_dir} for [{start.date()}..{end.date()}]")
 
-    start_month = start.normalize().replace(day=1)
-    end_month = end.normalize().replace(day=1)
-    months = list(pd.date_range(start_month, end_month, freq="MS"))
+    months = pick_months(start, end, RUN_MODE)
 
     # Infer buckets once (still useful if you later re-enable make_Xq_for_month)
-    buckets = infer_buckets_month_by_month(
+    _buckets = infer_buckets_month_by_month(
         vintage_dir=Path(vintage_dir),
         spec_file=Path(spec_file),
         gdp_series_id=GDP_SERIES_ID,
@@ -242,6 +241,8 @@ def main():
         vintage_end=VINTAGE_END,
         save_raw_draws=bool(SAVE_DRAWS),
         resume=bool(RESUME),
+        run_mode=RUN_MODE,
+        q_fixed=Q_FIXED,
     )
     data_config = dict(
         data_dir=str(DATA_DIR_REL),
@@ -266,105 +267,105 @@ def main():
 
         for month_T in months:
             month_T0 = pd.to_datetime(month_T).normalize().replace(day=1)
+            q = int(Q_FIXED)
 
-            for q in (1, 2, 3): #(1,2,3)(if you want to do all release dates)
-                tag = f"month={month_T0.date().isoformat()}_q={q}"
-                out_row_path = per_run_dir / f"{tag}.csv"
+            tag = f"month={month_T0.date().isoformat()}_q={q}"
+            out_row_path = per_run_dir / f"{tag}.csv"
 
-                # RESUME: read *all* rows for this (month,q)
-                if RESUME and out_row_path.exists():
-                    df_prev = pd.read_csv(out_row_path)
-                    prev_rows = df_prev.to_dict(orient="records")
-                    rows.extend(prev_rows)
-                    all_rows.extend(prev_rows)
-                    if not DEBUG:
-                        print(f"[{model_type}] skip {tag} (exists; {len(prev_rows)} target rows)")
-                    continue
+            # RESUME: read *all* rows for this (month,q)
+            if RESUME and out_row_path.exists():
+                df_prev = pd.read_csv(out_row_path)
+                prev_rows = df_prev.to_dict(orient="records")
+                rows.extend(prev_rows)
+                all_rows.extend(prev_rows)
+                if not DEBUG:
+                    print(f"[{model_type}] skip {tag} (exists; {len(prev_rows)} target rows)")
+                continue
 
-                v = pick_vintage_for_month_q(vintages, month_T0, q)
-                if v is None:
-                    if DEBUG:
-                        print(f"[{model_type}] no vintage for month={month_T0.date()} q={q}")
-                    continue
-
-                vintage_path = v.path
+            v = pick_vintage_for_month_q(vintages, month_T0, q)
+            if v is None:
                 if DEBUG:
-                    print("\n" + "=" * 80)
-                    print(f"DEBUG LOOP: month_T={month_T0.date()} q={q} chosen_vintage={vintage_path.name}")
-                    print("=" * 80)
+                    print(f"[{model_type}] no vintage for month={month_T0.date()} q={q}")
+                continue
 
-                # 1) Build dataset from vintage
-                D_v = build_zhang_data(
-                    vintage_file=vintage_path,
-                    spec_file=spec_file,
-                    gdp_series_id=GDP_SERIES_ID,
-                    sample_start=SAMPLE_START,
+            vintage_path = v.path
+            if DEBUG:
+                print("\n" + "=" * 80)
+                print(f"DEBUG LOOP: month_T={month_T0.date()} q={q} chosen_vintage={vintage_path.name}")
+                print("=" * 80)
+
+            # 1) Build dataset from vintage
+            D_v = build_zhang_data(
+                vintage_file=vintage_path,
+                spec_file=spec_file,
+                gdp_series_id=GDP_SERIES_ID,
+                sample_start=SAMPLE_START,
+            )
+
+            # 2) Trim to month_T (CRITICAL correctness step)
+            D_v = trim_data_to_month_T(D_v, month_T0)
+
+            # 3) Masking (optional; currently bypassed)
+            Dq_full = D_v
+
+            # 4) Rolling 10-year window ending at T
+            Dq = slice_rolling_10y_window(
+                Dq_full,
+                month_T=month_T0,
+                window_months=ROLLING_WINDOW_MONTHS,
+                allow_short_start=ALLOW_SHORT_START,
+            )
+
+            # 5) Estimate + nowcast (multi-target in res)
+            res = run_bay(
+                Dq,
+                R_max=R_MAX,
+                n_iter=N_ITER,
+                burn=BURN,
+                thin=THIN,
+                standardize=STANDARDIZE,
+                seed=SEED,
+                paper_defaults=PAPER_DEFAULTS,
+                use_sv=use_sv,
+                do_selection=do_selection,
+            )
+
+            # 6) Save outputs (returns LIST of rows)
+            now_rows, _diag = save_subrun_outputs(
+                run_dir=run_dir,
+                model_type=model_type,
+                tag=tag,
+                D=Dq,
+                res=res,
+                month_T=month_T0,
+                q=q,
+                vintage_file=vintage_path.name,
+                target_quarter=None,  # legacy; ignored
+            )
+
+            for r in now_rows:
+                r["run_id"] = run_dir.name
+                r.setdefault("month_in_quarter", int(month_in_quarter(month_T0)))
+
+            pd.DataFrame(now_rows).to_csv(out_row_path, index=False)
+
+            rows.extend(now_rows)
+            all_rows.extend(now_rows)
+
+            # simple progress: show the within-quarter row if present, else last row
+            log_row = now_rows[-1] if now_rows else None
+            if log_row:
+                print(
+                    f"[{model_type}] month={month_T0.date()} q={q} "
+                    f"vintage={vintage_path.name} "
+                    f"asofQ={log_row.get('asof_quarter')} targetQ={log_row.get('target_quarter')} "
+                    f"mean={float(log_row.get('nowcast_mean', float('nan'))):.4f} "
+                    f"p05={float(log_row.get('nowcast_p05', float('nan'))):.4f} "
+                    f"p95={float(log_row.get('nowcast_p95', float('nan'))):.4f} "
+                    f"(J={len(now_rows)})"
                 )
-
-                # 2) Trim to month_T (CRITICAL correctness step)
-                D_v = trim_data_to_month_T(D_v, month_T0)
-
-                # 3) Masking (optional; currently bypassed)
-                # Dq_full = make_Xq_for_month(D_v, buckets, month_T0, q=q)
-                Dq_full = D_v
-
-                # 4) Rolling 10-year window ending at T
-                Dq = slice_rolling_10y_window(
-                    Dq_full,
-                    month_T=month_T0,
-                    window_months=ROLLING_WINDOW_MONTHS,
-                    allow_short_start=ALLOW_SHORT_START,
-                )
-
-                # 5) Estimate + nowcast (multi-target in res)
-                res = run_bay(
-                    Dq,
-                    R_max=R_MAX,
-                    n_iter=N_ITER,
-                    burn=BURN,
-                    thin=THIN,
-                    standardize=STANDARDIZE,
-                    seed=SEED,
-                    paper_defaults=PAPER_DEFAULTS,
-                    use_sv=use_sv,
-                    do_selection=do_selection,
-                )
-
-                # 6) Save outputs (returns LIST of rows)
-                now_rows, _diag = save_subrun_outputs(
-                    run_dir=run_dir,
-                    model_type=model_type,
-                    tag=tag,
-                    D=Dq,
-                    res=res,
-                    month_T=month_T0,
-                    q=q,
-                    vintage_file=vintage_path.name,
-                    target_quarter=None,  # legacy; ignored
-                )
-
-                for r in now_rows:
-                    r["run_id"] = run_dir.name
-                    r.setdefault("month_in_quarter", int(month_in_quarter(month_T0)))
-
-                pd.DataFrame(now_rows).to_csv(out_row_path, index=False)
-
-                rows.extend(now_rows)
-                all_rows.extend(now_rows)
-
-                log_row = _pick_log_row(now_rows)
-                if log_row:
-                    print(
-                        f"[{model_type}] month={month_T0.date()} q={q} "
-                        f"vintage={vintage_path.name} "
-                        f"asofQ={log_row.get('asof_quarter')} targetQ={log_row.get('target_quarter')} "
-                        f"mean={float(log_row.get('nowcast_mean', float('nan'))):.4f} "
-                        f"p05={float(log_row.get('nowcast_p05', float('nan'))):.4f} "
-                        f"p95={float(log_row.get('nowcast_p95', float('nan'))):.4f} "
-                        f"(J={len(now_rows)})"
-                    )
-                else:
-                    print(f"[{model_type}] month={month_T0.date()} q={q} vintage={vintage_path.name} (no rows?)")
+            else:
+                print(f"[{model_type}] month={month_T0.date()} q={q} vintage={vintage_path.name} (no rows?)")
 
         if rows:
             df = pd.DataFrame(rows).copy()
@@ -373,6 +374,7 @@ def main():
             df = df.sort_values(["month", "q", "target_quarter"]).reset_index(drop=True)
 
             out_csv = run_dir / "nowcasts" / f"nowcasts_{model_type}.csv"
+            (run_dir / "nowcasts").mkdir(parents=True, exist_ok=True)
             df.to_csv(out_csv, index=False)
             print(f"Saved {out_csv}")
 
@@ -386,7 +388,7 @@ def main():
         df_all.to_csv(run_dir / "nowcasts" / "nowcasts.csv", index=False)
 
     # diagnostics summary (scan per-subrun diagnostics.json)
-    diag_files = sorted((run_dir / "posterior" / "per_run").glob("*/*/*/diagnostics.json"))  # <-- FIXED
+    diag_files = sorted((run_dir / "posterior" / "per_run").glob("*/*/*/diagnostics.json"))
     diag_rows = []
     for f in diag_files:
         try:

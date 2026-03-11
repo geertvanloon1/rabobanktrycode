@@ -111,10 +111,17 @@ def build_zhang_data(
     if freq[gdp_col] != "q":
         raise ValueError(f"Series '{gdp_series_id}' must have Frequency 'q' in spec; got '{freq[gdp_col]}'")
 
-    # Monthly panel = all monthly series EXCLUDING GDP
+    # Predictors panel = monthly series + quarterly indicators (excluding GDP target)
     monthly_cols = np.where(freq == "m")[0]
-    X_m = X[:, monthly_cols]
-    series_m = [spec.SeriesID[i] for i in monthly_cols]
+    quarterly_cols = np.where(freq == "q")[0]
+
+    panel_cols = np.concatenate([monthly_cols, quarterly_cols])
+
+    # Exclude GDP from predictors (avoid leakage / double-use)
+    panel_cols = np.array([i for i in panel_cols if i != gdp_col], dtype=int)
+
+    X_m = X[:, panel_cols]
+    series_m = [spec.SeriesID[i] for i in panel_cols]
 
     # Extract quarterly GDP y_q from its column: take non-NaN entries only
     y_full = X[:, gdp_col]

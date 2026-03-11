@@ -233,6 +233,28 @@ def run_bay(
 
     X = D.X_m.copy()
 
+# ===== DEBUG BLOCK START =====
+    col_n = np.sum(~np.isnan(X), axis=0)
+    all_nan = np.where(col_n == 0)[0]
+    one_obs = np.where(col_n == 1)[0]
+
+    if all_nan.size or one_obs.size:
+        print("\n[DEBUG] Problematic columns detected BEFORE standardization")
+        print("Total columns:", X.shape[1])
+        print("All-NaN columns:", all_nan.size)
+        print("One-observation columns:", one_obs.size)
+
+        # print example names if available
+        if hasattr(D, "series_m"):
+            names = D.series_m
+            if all_nan.size:
+                print("Example all-NaN series:",
+                      [names[i] for i in all_nan[:10]])
+            if one_obs.size:
+                print("Example 1-obs series:",
+                      [names[i] for i in one_obs[:10]])
+    # ===== DEBUG BLOCK END =====
+    
     # Standardize monthly panel to match priors scaling
     if standardize:
         X, mX, sX = _standardize_panel(X)
@@ -475,8 +497,6 @@ def run_bay(
             p[:] = 1.0
             pi = 1.0
 
-        if (it + 1) % 200 == 0:
-            print("post-selection z:", z.astype(int))
 
         # -----------------
         # store

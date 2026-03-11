@@ -17,10 +17,12 @@ import matplotlib.pyplot as plt
 
 from zhangnowcast.data.data import build_zhang_data
 
-# python3 scripts/make_artifacts_withrw.py --run_dir 
-# ----------------------------
+
+# python3 scripts/make_densityplots.py --run_dir 
+
+# =============================================================================
 # Utilities
-# ----------------------------
+# =============================================================================
 
 def _have_jinja2() -> bool:
     try:
@@ -81,6 +83,10 @@ def _period_str_to_periodQ(s: str) -> Optional[pd.Period]:
         return None
 
 
+# =============================================================================
+# Units conversion
+# =============================================================================
+
 def ann_to_qoq_pct(x_ann: pd.Series) -> pd.Series:
     x = pd.to_numeric(x_ann, errors="coerce") / 100.0
     return 100.0 * (np.power(1.0 + x, 1.0 / 4.0) - 1.0)
@@ -89,6 +95,21 @@ def ann_to_qoq_pct(x_ann: pd.Series) -> pd.Series:
 def qoq_to_ann_pct(x_qoq: pd.Series) -> pd.Series:
     x = pd.to_numeric(x_qoq, errors="coerce") / 100.0
     return 100.0 * (np.power(1.0 + x, 4.0) - 1.0)
+
+
+def ann_draws_to_qoq(draws_ann: np.ndarray) -> np.ndarray:
+    """
+    Elementwise transform for draws in percent annualized -> percent QoQ.
+    """
+    x = np.asarray(draws_ann, dtype=float) / 100.0
+    out = 100.0 * (np.power(1.0 + x, 1.0 / 4.0) - 1.0)
+    return out
+
+
+def qoq_draws_to_ann(draws_qoq: np.ndarray) -> np.ndarray:
+    x = np.asarray(draws_qoq, dtype=float) / 100.0
+    out = 100.0 * (np.power(1.0 + x, 4.0) - 1.0)
+    return out
 
 
 def _apply_display_units(now: pd.DataFrame, display_units: str, base_units: str = "annualized") -> pd.DataFrame:
@@ -104,6 +125,7 @@ def _apply_display_units(now: pd.DataFrame, display_units: str, base_units: str 
         "nowcast_p05",
         "nowcast_p50",
         "nowcast_p95",
+        "nowcast_sd",
         "actual",
         "rw_nowcast",
     ]
@@ -126,22 +148,9 @@ def _apply_display_units(now: pd.DataFrame, display_units: str, base_units: str 
     return df
 
 
-def _place_right_label(ax, x, y, text, used_y: List[float], min_sep: float, **kwargs) -> None:
-    """
-    Place labels on the right side while avoiding heavy overlap by nudging y upward.
-    """
-    yy = float(y)
-    for _ in range(40):
-        if all(abs(yy - uy) > min_sep for uy in used_y):
-            break
-        yy += min_sep
-    used_y.append(yy)
-    ax.text(x, yy, text, **kwargs)
-
-
-# ----------------------------
+# =============================================================================
 # Actual GDP + RW benchmark helpers
-# ----------------------------
+# =============================================================================
 
 def build_actual_gdp_lookup(
     project_root: Path,
@@ -152,7 +161,6 @@ def build_actual_gdp_lookup(
 ) -> pd.Series:
     """
     Map quarter label (e.g., '2020Q1') -> realized GDP value from a complete vintage.
-
     Uses build_zhang_data() so transforms match the runner.
     """
     actual_vintage = (project_root / Path(actual_vintage_rel)).resolve()
@@ -210,9 +218,9 @@ def attach_actual_and_rw(now: pd.DataFrame, actual_by_q: pd.Series) -> pd.DataFr
     return df
 
 
-# ----------------------------
-# Posterior pack loading (optional; kept for compatibility)
-# ----------------------------
+# =============================================================================
+# Posterior pack loading (density-aware)
+# =============================================================================
 
 @dataclass
 class PosteriorPack:
@@ -224,6 +232,14 @@ class PosteriorPack:
     vintage_file: str
     path: Path
 
+    # Posterior predictive for targets:
+    nowcast_targets: np.ndarray            # (J,)
+    nowcast_draws_matrix: np.ndarray       # (S,J)  NEW (preferred)
+
+    # (optional) older single-target key:
+    nowcast_draws_legacy: np.ndarray       # (S,) or empty
+
+    # Some posterior params (optional; kept)
     F_mean: np.ndarray
     F_sd: np.ndarray
     Lambda_mean: np.ndarray
@@ -240,7 +256,6 @@ class PosteriorPack:
     omega_mean: np.ndarray
     omega_sd: np.ndarray
     tau2_mean: float
-    nowcast_draws: np.ndarray
 
     dates_m: np.ndarray
     dates_q: np.ndarray
@@ -271,6 +286,23 @@ def load_posterior_pack(model: str, subdir: Path) -> Optional[PosteriorPack]:
     m0 = _coerce_month(month)
     miq_use = miq if miq > 0 else (((int(m0.month) - 1) % 3) + 1)
 
+    # --- density payload (preferred keys from your saver) ---
+    nowcast_draws_matrix = get("nowcast_draws_matrix")
+    nowcast_targets = get("nowcast_targets")
+
+    # --- fallback: legacy single-target draw vector stored as "nowcast_draws" ---
+    nowcast_draws_legacy = get("nowcast_draws")
+    if nowcast_draws_matrix is None or np.asarray(nowcast_draws_matrix).size == 0:
+        if nowcast_draws_legacy is not None and np.asarray(nowcast_draws_legacy).ndim == 1:
+            nowcast_draws_matrix = np.asarray(nowcast_draws_legacy, dtype=float)[:, None]
+        else:
+            nowcast_draws_matrix = np.asarray([], dtype=float)
+
+    if nowcast_targets is None or np.asarray(nowcast_targets).size == 0:
+        # try meta
+        tqs = meta.get("nowcast_targets", [])
+        nowcast_targets = np.asarray([str(x) for x in tqs], dtype=object)
+
     return PosteriorPack(
         model=model,
         tag=tag,
@@ -280,23 +312,26 @@ def load_posterior_pack(model: str, subdir: Path) -> Optional[PosteriorPack]:
         vintage_file=vint,
         path=subdir,
 
-        F_mean=get("F_mean"),
-        F_sd=get("F_sd"),
-        Lambda_mean=get("Lambda_mean"),
-        Lambda_sd=get("Lambda_sd"),
-        mu_mean=get("mu_mean"),
-        z_mean=get("z_mean"),
-        z_draws=get("z_draws"),
-        r_draws=get("r_draws"),
-        beta_mean=get("beta_mean"),
-        a_mean=get("a_mean"),
-        sigma2_mean=get("sigma2_mean"),
+        nowcast_targets=np.asarray(nowcast_targets, dtype=object) if nowcast_targets is not None else np.asarray([], dtype=object),
+        nowcast_draws_matrix=np.asarray(nowcast_draws_matrix, dtype=float) if nowcast_draws_matrix is not None else np.asarray([], dtype=float),
+        nowcast_draws_legacy=np.asarray(nowcast_draws_legacy, dtype=float) if nowcast_draws_legacy is not None else np.asarray([], dtype=float),
+
+        F_mean=get("F_mean") if get("F_mean") is not None else np.asarray([]),
+        F_sd=get("F_sd") if get("F_sd") is not None else np.asarray([]),
+        Lambda_mean=get("Lambda_mean") if get("Lambda_mean") is not None else np.asarray([]),
+        Lambda_sd=get("Lambda_sd") if get("Lambda_sd") is not None else np.asarray([]),
+        mu_mean=get("mu_mean") if get("mu_mean") is not None else np.asarray([]),
+        z_mean=get("z_mean") if get("z_mean") is not None else np.asarray([]),
+        z_draws=get("z_draws") if get("z_draws") is not None else np.asarray([]),
+        r_draws=get("r_draws") if get("r_draws") is not None else np.asarray([]),
+        beta_mean=get("beta_mean") if get("beta_mean") is not None else np.asarray([]),
+        a_mean=get("a_mean") if get("a_mean") is not None else np.asarray([]),
+        sigma2_mean=get("sigma2_mean") if get("sigma2_mean") is not None else np.asarray([]),
         eta2_mean=float(get("eta2_mean")) if get("eta2_mean") is not None else float("nan"),
-        Psi_mean=get("Psi_mean"),
-        omega_mean=get("omega_mean"),
-        omega_sd=get("omega_sd"),
+        Psi_mean=get("Psi_mean") if get("Psi_mean") is not None else np.asarray([]),
+        omega_mean=get("omega_mean") if get("omega_mean") is not None else np.asarray([]),
+        omega_sd=get("omega_sd") if get("omega_sd") is not None else np.asarray([]),
         tau2_mean=float(get("tau2_mean")) if get("tau2_mean") is not None else float("nan"),
-        nowcast_draws=get("nowcast_draws") if get("nowcast_draws") is not None else np.asarray([]),
 
         dates_m=get("dates_m") if get("dates_m") is not None else np.asarray([]),
         dates_q=get("dates_q") if get("dates_q") is not None else np.asarray([]),
@@ -310,7 +345,6 @@ def load_posterior_pack(model: str, subdir: Path) -> Optional[PosteriorPack]:
 def scan_run(run_dir: Path) -> Tuple[pd.DataFrame, List[PosteriorPack], dict]:
     meta = _safe_read_json(run_dir / "run_metadata.json")
 
-    # Prefer enriched if already exists
     nowcasts_path = run_dir / "nowcasts" / "nowcasts_with_actual_rw.csv"
     if not nowcasts_path.exists():
         nowcasts_path = run_dir / "nowcasts" / "nowcasts.csv"
@@ -361,9 +395,9 @@ def scan_run(run_dir: Path) -> Tuple[pd.DataFrame, List[PosteriorPack], dict]:
     return now, packs, meta
 
 
-# ----------------------------
-# Derived columns for new logic
-# ----------------------------
+# =============================================================================
+# Derived columns for within-quarter logic
+# =============================================================================
 
 def _quarter_start_month(tq: str) -> Optional[pd.Timestamp]:
     p = _period_str_to_periodQ(tq)
@@ -433,9 +467,9 @@ def add_release_date(now: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ----------------------------
-# Tables
-# ----------------------------
+# =============================================================================
+# Mean-error tables (yours, kept)
+# =============================================================================
 
 def table_run_summary(meta: dict) -> pd.DataFrame:
     batch = meta.get("batch_config", {})
@@ -462,13 +496,14 @@ def table_run_summary(meta: dict) -> pd.DataFrame:
         ("gdp_series_id", data.get("gdp_series_id", "")),
         ("sample_start", data.get("sample_start", "")),
         ("pattern", data.get("pattern", "")),
+        ("save_raw_draws", batch.get("save_raw_draws", "")),
     ]
     return pd.DataFrame(rows, columns=["key", "value"])
 
 
 def table_nowcast_errors_within_quarter(now: pd.DataFrame) -> pd.DataFrame:
     """
-    Within-quarter nowcast errors:
+    Within-quarter mean nowcast errors:
       - Uses rows where asof_in_target==True
       - Groups by model and rel_step_label (m1-q1 ... m3-q3)
     """
@@ -523,7 +558,7 @@ def table_nowcast_errors_within_quarter(now: pd.DataFrame) -> pd.DataFrame:
 
 def table_nowcast_errors_final_before_release(now: pd.DataFrame) -> pd.DataFrame:
     """
-    Final-before-release errors:
+    Final-before-release mean nowcast errors:
       - For each (model, target_quarter), take last nowcast row in time (month,q).
       - Aggregate by model.
     """
@@ -571,17 +606,405 @@ def table_nowcast_errors_final_before_release(now: pd.DataFrame) -> pd.DataFrame
     return pd.DataFrame(out).sort_values(["model"]).reset_index(drop=True)
 
 
-# ----------------------------
-# Figures (updated to new logic)
-# ----------------------------
+# =============================================================================
+# Density scoring
+# =============================================================================
 
-def fig_revision_paths_from_qstart_until_release(
-    now: pd.DataFrame,
-    model: str,
-    outdir: Path,
-    ylab: str,
-    last_k_quarters: int = 6,
-) -> None:
+def crps_from_draws(draws: np.ndarray, y: float) -> float:
+    """
+    CRPS from Monte Carlo draws:
+      CRPS = E|X-y| - 0.5 E|X-X'|
+    Using O(S log S) exact formula for E|X-X'| via sorting.
+    """
+    x = np.asarray(draws, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 20 or not np.isfinite(y):
+        return float("nan")
+    term1 = float(np.mean(np.abs(x - y)))
+    xs = np.sort(x)
+    S = xs.size
+    i = np.arange(1, S + 1)
+    e_abs_xx = float((2.0 / (S * S)) * np.sum((2 * i - S - 1) * xs))
+    return term1 - 0.5 * e_abs_xx
+
+
+def pit_from_draws(draws: np.ndarray, y: float, rng: np.random.Generator) -> float:
+    x = np.asarray(draws, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 20 or not np.isfinite(y):
+        return float("nan")
+    lt = np.mean(x < y)
+    eq = np.mean(x == y)
+    return float(lt + rng.random() * eq)
+
+
+def hist_logscore(draws: np.ndarray, y: float, nbins: int = 60, eps: float = 1e-12) -> float:
+    """
+    Approximate log predictive density at y using a histogram density estimate.
+    (Stable and dependency-free.)
+    """
+    x = np.asarray(draws, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 50 or not np.isfinite(y):
+        return float("nan")
+
+    lo, hi = np.quantile(x, [0.001, 0.999])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return float("nan")
+
+    pad = 0.02 * (hi - lo)
+    lo -= pad
+    hi += pad
+
+    counts, edges = np.histogram(x, bins=nbins, range=(lo, hi), density=False)
+    binw = float(edges[1] - edges[0])
+    dens = (counts / max(1, x.size)) / max(binw, eps)
+
+    if y < lo or y > hi:
+        return float(np.log(eps))
+
+    b = int(np.clip(np.searchsorted(edges, y, side="right") - 1, 0, nbins - 1))
+    return float(np.log(max(dens[b], eps)))
+
+
+def _pack_index(packs: List[PosteriorPack]) -> Dict[Tuple[str, str], PosteriorPack]:
+    return {(p.model, p.tag): p for p in packs}
+
+
+def _get_draws_for_row(
+    r: pd.Series,
+    pack: PosteriorPack,
+    display_units: str,
+    base_units: str = "annualized",
+) -> Optional[np.ndarray]:
+    """
+    Return predictive draws for THIS row's (target_quarter) from pack, transformed to display_units.
+    """
+    if pack is None or pack.nowcast_draws_matrix is None or pack.nowcast_draws_matrix.size == 0:
+        return None
+
+    tqs = list(map(str, np.asarray(pack.nowcast_targets).tolist()))
+    tq = str(r["target_quarter"])
+    if tq not in tqs:
+        return None
+    j = tqs.index(tq)
+
+    draws = np.asarray(pack.nowcast_draws_matrix)[:, j].astype(float)
+    draws = draws[np.isfinite(draws)]
+    if draws.size < 20:
+        return None
+
+    if base_units == display_units:
+        return draws
+    if base_units == "annualized" and display_units == "qoq":
+        return ann_draws_to_qoq(draws)
+    if base_units == "qoq" and display_units == "annualized":
+        return qoq_draws_to_ann(draws)
+    return draws
+
+
+def density_scores_current_quarter(now: pd.DataFrame, packs: List[PosteriorPack], display_units: str) -> pd.DataFrame:
+    """
+    Density scores for the true nowcasting task: asof_in_target==True.
+    """
+    df = now[(now["asof_in_target"] == True) & (now["actual_disp"].notna())].copy()
+    if df.empty:
+        return pd.DataFrame([{"note": "No rows with asof_in_target==True and non-NaN actual_disp."}])
+
+    df = df.sort_values(["model", "release_date", "q"]).copy()
+    pidx = _pack_index(packs)
+    rng = np.random.default_rng(123)
+
+    out = []
+    for _, r in df.iterrows():
+        model = str(r["model"])
+        tag = str(r.get("subrun_tag", ""))
+        pack = pidx.get((model, tag))
+        draws = _get_draws_for_row(r, pack, display_units=display_units)
+        if draws is None:
+            continue
+
+        y = float(r["actual_disp"])
+        lo90, hi90 = np.quantile(draws, [0.05, 0.95])
+
+        out.append(dict(
+            model=model,
+            subrun_tag=tag,
+            release_date=pd.to_datetime(r.get("release_date", pd.NaT)),
+            month=pd.to_datetime(r.get("month", pd.NaT)),
+            q=int(r.get("q", -1)),
+            target_quarter=str(r["target_quarter"]),
+            rel_step_label=str(r.get("rel_step_label", "")),
+            crps=crps_from_draws(draws, y),
+            logscore=hist_logscore(draws, y),
+            pit=pit_from_draws(draws, y, rng=rng),
+            cover90=float(lo90 <= y <= hi90),
+            width90=float(hi90 - lo90),
+            draws_n=int(draws.size),
+        ))
+
+    return pd.DataFrame(out)
+
+
+def density_scores_final_before_release(now: pd.DataFrame, packs: List[PosteriorPack], display_units: str) -> pd.DataFrame:
+    """
+    Density scores for "final before release": last snapshot per (model, target_quarter).
+    """
+    df = now[now["actual_disp"].notna()].copy()
+    if df.empty:
+        return pd.DataFrame([{"note": "No rows with non-NaN actual_disp."}])
+    if "target_quarter" not in df.columns:
+        return pd.DataFrame([{"note": "Missing target_quarter; cannot compute final-before-release density scores."}])
+
+    df = df.sort_values(["model", "target_quarter", "month", "q"]).copy()
+    last_rows = df.groupby(["model", "target_quarter"], as_index=False).tail(1).copy()
+
+    pidx = _pack_index(packs)
+    rng = np.random.default_rng(456)
+
+    out = []
+    for _, r in last_rows.iterrows():
+        model = str(r["model"])
+        tag = str(r.get("subrun_tag", ""))
+        pack = pidx.get((model, tag))
+        draws = _get_draws_for_row(r, pack, display_units=display_units)
+        if draws is None:
+            continue
+
+        y = float(r["actual_disp"])
+        lo90, hi90 = np.quantile(draws, [0.05, 0.95])
+
+        out.append(dict(
+            model=model,
+            subrun_tag=tag,
+            release_date=pd.to_datetime(r.get("release_date", pd.NaT)),
+            month=pd.to_datetime(r.get("month", pd.NaT)),
+            q=int(r.get("q", -1)),
+            target_quarter=str(r["target_quarter"]),
+            crps=crps_from_draws(draws, y),
+            logscore=hist_logscore(draws, y),
+            pit=pit_from_draws(draws, y, rng=rng),
+            cover90=float(lo90 <= y <= hi90),
+            width90=float(hi90 - lo90),
+            draws_n=int(draws.size),
+        ))
+
+    return pd.DataFrame(out)
+
+
+def summarize_density_scores(scores: pd.DataFrame, by_step: bool = False) -> pd.DataFrame:
+    if "note" in scores.columns:
+        return scores.copy()
+
+    group_cols = ["model"]
+    if by_step and "rel_step_label" in scores.columns:
+        group_cols = ["model", "rel_step_label"]
+
+    g = scores.groupby(group_cols, as_index=False).agg(
+        n=("crps", "count"),
+        mean_crps=("crps", "mean"),
+        mean_logscore=("logscore", "mean"),
+        mean_cover90=("cover90", "mean"),
+        mean_width90=("width90", "mean"),
+        mean_pit=("pit", "mean"),
+    )
+    return g
+
+
+# =============================================================================
+# DM test (Diebold–Mariano) for score differences
+# =============================================================================
+
+def _newey_west_var(d: np.ndarray, L: int) -> float:
+    """
+    Newey–West variance estimate of mean(d) with lag L.
+    """
+    d = np.asarray(d, dtype=float)
+    d = d[np.isfinite(d)]
+    T = d.size
+    if T < 3:
+        return float("nan")
+
+    d0 = d - d.mean()
+    gamma0 = np.mean(d0 * d0)
+
+    var = gamma0
+    for l in range(1, min(L, T - 1) + 1):
+        w = 1.0 - l / (L + 1.0)
+        gamma = np.mean(d0[l:] * d0[:-l])
+        var += 2.0 * w * gamma
+
+    # variance of sample mean
+    return float(var / T)
+
+
+def dm_test(scores_a: pd.DataFrame, scores_b: pd.DataFrame, key_cols: List[str], score_col: str, hac_lag: int = 1) -> pd.DataFrame:
+    """
+    DM test on d_t = score_a - score_b aligned on key_cols.
+    Lower is better for CRPS; higher is better for logscore.
+    You interpret sign accordingly.
+    """
+    a = scores_a[key_cols + [score_col]].rename(columns={score_col: "a"})
+    b = scores_b[key_cols + [score_col]].rename(columns={score_col: "b"})
+    m = a.merge(b, on=key_cols, how="inner")
+    if m.empty:
+        return pd.DataFrame([{"note": f"No overlap for DM test on {score_col}"}])
+
+    d = (m["a"] - m["b"]).to_numpy(dtype=float)
+    d = d[np.isfinite(d)]
+    if d.size < 8:
+        return pd.DataFrame([{"note": f"Too few paired observations for DM test on {score_col}", "n": int(d.size)}])
+
+    mean_d = float(np.mean(d))
+    var_mean = _newey_west_var(d, L=hac_lag)
+    if not np.isfinite(var_mean) or var_mean <= 0:
+        return pd.DataFrame([{"note": f"NW variance failed for DM test on {score_col}", "n": int(d.size)}])
+
+    dm_stat = mean_d / np.sqrt(var_mean)
+    # normal approx p-value
+    from math import erf, sqrt
+    pval = 2.0 * (1.0 - 0.5 * (1.0 + erf(abs(dm_stat) / sqrt(2.0))))
+
+    return pd.DataFrame([{
+        "score": score_col,
+        "n": int(d.size),
+        "hac_lag": int(hac_lag),
+        "mean_diff_a_minus_b": mean_d,
+        "dm_stat": float(dm_stat),
+        "p_value": float(pval),
+    }])
+
+
+# =============================================================================
+# Density plots
+# =============================================================================
+
+def fig_fan_chart_current_target(now: pd.DataFrame, packs: List[PosteriorPack], model: str, outdir: Path, ylab: str,
+                                 display_units: str, bands=(0.5, 0.7, 0.9), base_units: str = "annualized") -> None:
+    """
+    Fan chart for current-quarter nowcasts (calendar time):
+      shaded credible intervals + mean + actual.
+    """
+    df = now[(now["model"] == model) & (now["asof_in_target"] == True)].copy()
+    if df.empty or "release_date" not in df.columns:
+        return
+
+    df = df.sort_values(["release_date", "q"]).copy()
+    pidx = _pack_index(packs)
+
+    rows = []
+    for _, r in df.iterrows():
+        tag = str(r.get("subrun_tag", ""))
+        pack = pidx.get((model, tag))
+        draws = _get_draws_for_row(r, pack, display_units=display_units, base_units=base_units)
+        if draws is None or draws.size < 50:
+            continue
+
+        rec = dict(
+            release_date=pd.to_datetime(r["release_date"]),
+            mean=float(np.mean(draws)),
+            actual=float(r["actual_disp"]) if pd.notna(r.get("actual_disp", np.nan)) else np.nan,
+        )
+        for b in bands:
+            lo = (1 - b) / 2
+            hi = 1 - lo
+            rec[f"lo{int(b*100)}"] = float(np.quantile(draws, lo))
+            rec[f"hi{int(b*100)}"] = float(np.quantile(draws, hi))
+        rows.append(rec)
+
+    if not rows:
+        return
+
+    qdf = pd.DataFrame(rows).sort_values("release_date")
+    fig = plt.figure(figsize=(12, 4))
+    ax = plt.gca()
+
+    for b in sorted(bands, reverse=True):
+        ax.fill_between(qdf["release_date"], qdf[f"lo{int(b*100)}"], qdf[f"hi{int(b*100)}"], alpha=0.2,
+                        label=f"{int(b*100)}% band")
+
+    ax.plot(qdf["release_date"], qdf["mean"], marker="o", linewidth=1.5, label="mean")
+    if qdf["actual"].notna().any():
+        ax.plot(qdf["release_date"], qdf["actual"], marker="o", linewidth=1.5, label="actual")
+
+    ax.set_title(f"{model} | Current-quarter density nowcast (fan chart)")
+    ax.set_xlabel("Release date")
+    ax.set_ylabel(ylab)
+    ax.legend(fontsize=8, ncol=4)
+    _savefig(fig, outdir / f"fan_chart_current_target__{model}")
+
+
+def fig_density_heatmap_current_target(now: pd.DataFrame, packs: List[PosteriorPack], model: str, outdir: Path, ylab: str,
+                                       display_units: str, grid_n: int = 160, base_units: str = "annualized") -> None:
+    """
+    Heatmap of predictive density over time for current-quarter nowcasts.
+    """
+    df = now[(now["model"] == model) & (now["asof_in_target"] == True)].copy()
+    if df.empty or "release_date" not in df.columns:
+        return
+
+    df = df.sort_values(["release_date", "q"]).copy()
+    pidx = _pack_index(packs)
+
+    series = []
+    dates = []
+    for _, r in df.iterrows():
+        tag = str(r.get("subrun_tag", ""))
+        pack = pidx.get((model, tag))
+        draws = _get_draws_for_row(r, pack, display_units=display_units, base_units=base_units)
+        if draws is None or draws.size < 50:
+            continue
+        series.append(draws)
+        dates.append(pd.to_datetime(r["release_date"]))
+
+    if len(series) < 3:
+        return
+
+    allx = np.concatenate(series)
+    lo, hi = np.quantile(allx, [0.01, 0.99])
+    ygrid = np.linspace(lo, hi, grid_n)
+
+    dens = np.zeros((grid_n - 1, len(series)))
+    for i, d in enumerate(series):
+        c, _ = np.histogram(d, bins=ygrid, density=True)
+        dens[:, i] = c
+
+    fig = plt.figure(figsize=(12, 5))
+    ax = plt.gca()
+    im = ax.imshow(
+        dens, aspect="auto", origin="lower",
+        extent=[0, len(dates) - 1, ygrid[0], ygrid[-1]]
+    )
+    ax.set_xticks(range(len(dates)))
+    ax.set_xticklabels([pd.Timestamp(x).date().isoformat() for x in dates], rotation=45, ha="right", fontsize=7)
+    ax.set_ylabel(ylab)
+    ax.set_title(f"{model} | Current-quarter predictive density (heatmap)")
+    fig.colorbar(im, ax=ax, label="density")
+    _savefig(fig, outdir / f"density_heatmap_current_target__{model}")
+
+
+def fig_pit_hist(scores: pd.DataFrame, model: str, outdir: Path, title_suffix: str) -> None:
+    d = scores[scores["model"] == model].copy()
+    if d.empty or "pit" not in d.columns:
+        return
+    pit = pd.to_numeric(d["pit"], errors="coerce").dropna().to_numpy()
+    if pit.size < 20:
+        return
+
+    fig = plt.figure(figsize=(7, 4))
+    ax = plt.gca()
+    ax.hist(pit, bins=10, density=True)
+    ax.set_xlabel("PIT")
+    ax.set_ylabel("density")
+    ax.set_title(f"{model} | PIT histogram ({title_suffix})")
+    _savefig(fig, outdir / f"pit_hist__{_nice(title_suffix)}__{model}")
+
+
+# =============================================================================
+# Existing mean figures (yours, kept as-is)
+# =============================================================================
+
+def fig_revision_paths_from_qstart_until_release(now: pd.DataFrame, model: str, outdir: Path, ylab: str, last_k_quarters: int = 6) -> None:
     df = now[now["model"] == model].copy()
     if df.empty or "target_quarter" not in df.columns:
         return
@@ -596,16 +1019,9 @@ def fig_revision_paths_from_qstart_until_release(
     tq_periods.sort(key=lambda x: x[1])
     tq_use = [t for (t, _) in tq_periods][-last_k_quarters:]
 
-    # label spacing
-    yvals = pd.to_numeric(df.get("nowcast_mean_disp", pd.Series(dtype=float)), errors="coerce")
-    yr = float(np.nanmax(yvals) - np.nanmin(yvals)) if yvals.notna().any() else 10.0
-    min_sep = max(0.25, 0.03 * yr)
-
     fig = plt.figure(figsize=(11, 5))
     ax = plt.gca()
-
     max_step = 0
-    used_y: List[float] = []
 
     for t in tq_use:
         g = df[df["target_quarter"].astype(str) == str(t)].copy()
@@ -628,10 +1044,6 @@ def fig_revision_paths_from_qstart_until_release(
         if "actual_disp" in g.columns and g["actual_disp"].notna().any():
             a = float(g["actual_disp"].dropna().iloc[0])
             ax.hlines(a, xmin=int(xs.min()), xmax=int(xs.max()), linestyles="dashed", linewidth=1)
-            ax.text(
-                float(xs.max()) + 0.15, a, f"{t} actual",
-                fontsize=8, va="center"
-            )
 
     ticks = list(range(0, max_step + 1))
     labels = [_rel_step_label(s) for s in ticks]
@@ -646,13 +1058,7 @@ def fig_revision_paths_from_qstart_until_release(
     _savefig(fig, outdir / f"revision_paths_until_release__{model}")
 
 
-def fig_within_quarter_nowcast_paths(
-    now: pd.DataFrame,
-    model: str,
-    outdir: Path,
-    ylab: str,
-    last_k_quarters: int = 8,
-) -> None:
+def fig_within_quarter_nowcast_paths(now: pd.DataFrame, model: str, outdir: Path, ylab: str, last_k_quarters: int = 8) -> None:
     df = now[(now["model"] == model) & (now["asof_in_target"] == True)].copy()
     if df.empty or "target_quarter" not in df.columns:
         return
@@ -667,13 +1073,8 @@ def fig_within_quarter_nowcast_paths(
     tq_periods.sort(key=lambda x: x[1])
     tq_use = [t for (t, _) in tq_periods][-last_k_quarters:]
 
-    yvals = pd.to_numeric(df.get("nowcast_mean_disp", pd.Series(dtype=float)), errors="coerce")
-    yr = float(np.nanmax(yvals) - np.nanmin(yvals)) if yvals.notna().any() else 10.0
-    min_sep = max(0.25, 0.03 * yr)
-
     fig = plt.figure(figsize=(11, 5))
     ax = plt.gca()
-    used_y: List[float] = []
 
     for t in tq_use:
         g = df[df["target_quarter"].astype(str) == str(t)].copy()
@@ -691,10 +1092,6 @@ def fig_within_quarter_nowcast_paths(
         if "actual_disp" in g.columns and g["actual_disp"].notna().any():
             a = float(g["actual_disp"].dropna().iloc[0])
             ax.hlines(a, xmin=0, xmax=8, linestyles="dashed", linewidth=1)
-            ax.text(
-                float(xs.max()) + 0.15, a, f"{t} actual",
-                fontsize=8, va="center"
-            )
 
     ticks = list(range(0, 9))
     labels = [_rel_step_label(s) for s in ticks]
@@ -709,13 +1106,7 @@ def fig_within_quarter_nowcast_paths(
     _savefig(fig, outdir / f"within_quarter_paths__{model}")
 
 
-def fig_actual_vs_final_nowcast_over_time(
-    now: pd.DataFrame,
-    model: str,
-    outdir: Path,
-    ylab: str,
-    last_k_quarters: int = 12,
-) -> None:
+def fig_actual_vs_final_nowcast_over_time(now: pd.DataFrame, model: str, outdir: Path, ylab: str, last_k_quarters: int = 12) -> None:
     df = now[now["model"] == model].copy()
     if df.empty or "target_quarter" not in df.columns:
         return
@@ -746,16 +1137,7 @@ def fig_actual_vs_final_nowcast_over_time(
     _savefig(fig, outdir / f"actual_vs_final_nowcast__{model}")
 
 
-def fig_all_nowcasts_calendar_current_target(
-    now: pd.DataFrame,
-    model: str,
-    outdir: Path,
-    ylab: str,
-) -> None:
-    """
-    One calendar-time graph (x-axis = release_date) plotting ONLY the current-target nowcasts:
-      rows where asof_in_target==True.
-    """
+def fig_all_nowcasts_calendar_current_target(now: pd.DataFrame, model: str, outdir: Path, ylab: str) -> None:
     df = now[(now["model"] == model) & (now["asof_in_target"] == True)].copy()
     if df.empty:
         return
@@ -769,7 +1151,6 @@ def fig_all_nowcasts_calendar_current_target(
     ax.plot(df["release_date"], df["nowcast_mean_disp"], marker="o", linewidth=1.5, label="current-quarter nowcast")
 
     if "actual_disp" in df.columns and df["actual_disp"].notna().any():
-        # show actual per target quarter as horizontal segments across its date span
         for tq, g in df.groupby(df["target_quarter"].astype(str)):
             if g["actual_disp"].notna().any():
                 a = float(g["actual_disp"].dropna().iloc[0])
@@ -783,16 +1164,7 @@ def fig_all_nowcasts_calendar_current_target(
     _savefig(fig, outdir / f"calendar_current_target__{model}")
 
 
-def fig_all_nowcasts_calendar_by_target(
-    now: pd.DataFrame,
-    model: str,
-    outdir: Path,
-    ylab: str,
-    last_k_quarters: int = 12,
-) -> None:
-    """
-    One calendar-time graph (x-axis = release_date) with one line per target_quarter.
-    """
+def fig_all_nowcasts_calendar_by_target(now: pd.DataFrame, model: str, outdir: Path, ylab: str, last_k_quarters: int = 12) -> None:
     df = now[now["model"] == model].copy()
     if df.empty:
         return
@@ -831,9 +1203,9 @@ def fig_all_nowcasts_calendar_by_target(
     _savefig(fig, outdir / f"calendar_all_targets__{model}")
 
 
-# ----------------------------
+# =============================================================================
 # Orchestration
-# ----------------------------
+# =============================================================================
 
 def main():
     ap = argparse.ArgumentParser()
@@ -849,11 +1221,11 @@ def main():
     ap.add_argument("--display_units", type=str, default="annualized", choices=["qoq", "annualized"],
                     help="Units for plots/tables. 'qoq' converts from annualized via compounding.")
 
-    ap.add_argument("--last_k_quarters", type=int, default=12,
-                    help="How many recent quarters to show in time plots.")
-    ap.add_argument("--last_k_revision_quarters", type=int, default=6,
-                    help="How many recent quarters to show in revision plots.")
+    ap.add_argument("--last_k_quarters", type=int, default=12)
+    ap.add_argument("--last_k_revision_quarters", type=int, default=6)
 
+    # density options
+    ap.add_argument("--hac_lag", type=int, default=1, help="HAC lag for DM test (Newey–West).")
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
@@ -867,7 +1239,7 @@ def main():
     _ensure_dir(fig_dir)
     _ensure_dir(tab_dir)
 
-    now, _packs, meta = scan_run(run_dir)
+    now, packs, meta = scan_run(run_dir)
 
     # Attach realized GDP + RW benchmark
     try:
@@ -889,7 +1261,7 @@ def main():
     ylab = "Real GDP growth (QoQ, %)" if args.display_units == "qoq" else "Real GDP growth (annualized, %)"
     now = _apply_display_units(now, display_units=args.display_units, base_units="annualized")
 
-    # New columns for new logic
+    # Derived columns
     now = add_release_step_columns(now)
     now = add_release_date(now)
 
@@ -897,7 +1269,9 @@ def main():
     (run_dir / "nowcasts").mkdir(parents=True, exist_ok=True)
     now.to_csv(run_dir / "nowcasts" / "nowcasts_with_actual_rw.csv", index=False)
 
-    # Tables
+    # ----------------------------
+    # Tables: run summary + mean error metrics (existing)
+    # ----------------------------
     run_summary = table_run_summary(meta)
     run_summary.to_csv(tab_dir / "run_summary.csv", index=False)
     _to_latex_table(run_summary, tab_dir / "run_summary.tex", caption="Run summary", label="tab:run_summary")
@@ -907,7 +1281,7 @@ def main():
     _to_latex_table(
         err_wq,
         tab_dir / "nowcast_errors_within_quarter.tex",
-        caption=f"Within-quarter nowcast error metrics (units: {args.display_units})",
+        caption=f"Within-quarter mean error metrics (units: {args.display_units})",
         label="tab:nowcast_errors_within_quarter",
     )
 
@@ -916,34 +1290,73 @@ def main():
     _to_latex_table(
         err_final,
         tab_dir / "nowcast_errors_final_before_release.tex",
-        caption=f"Final-before-release nowcast error metrics (units: {args.display_units})",
+        caption=f"Final-before-release mean error metrics (units: {args.display_units})",
         label="tab:nowcast_errors_final_before_release",
     )
 
-    # Figures
+    # ----------------------------
+    # Density tables: scores + summaries + DM tests
+    # ----------------------------
+    dens_cur = density_scores_current_quarter(now, packs, display_units=args.display_units)
+    dens_cur.to_csv(tab_dir / "density_scores_current_quarter.csv", index=False)
+
+    dens_final = density_scores_final_before_release(now, packs, display_units=args.display_units)
+    dens_final.to_csv(tab_dir / "density_scores_final_before_release.csv", index=False)
+
+    dens_cur_sum = summarize_density_scores(dens_cur, by_step=False)
+    dens_cur_sum.to_csv(tab_dir / "density_summary_current_quarter.csv", index=False)
+
+    dens_cur_by_step = summarize_density_scores(dens_cur, by_step=True)
+    dens_cur_by_step.to_csv(tab_dir / "density_summary_current_quarter_by_step.csv", index=False)
+
+    dens_final_sum = summarize_density_scores(dens_final, by_step=False)
+    dens_final_sum.to_csv(tab_dir / "density_summary_final_before_release.csv", index=False)
+
+    # DM tests: only if at least 2 models exist
+    models = sorted(now["model"].dropna().unique())
+    if len(models) >= 2 and "note" not in dens_final.columns:
+        # choose first two models for DM (you can extend easily)
+        mA, mB = models[0], models[1]
+        A = dens_final[dens_final["model"] == mA].copy()
+        B = dens_final[dens_final["model"] == mB].copy()
+
+        # align by target_quarter for final-before-release
+        dm_crps = dm_test(A, B, key_cols=["target_quarter"], score_col="crps", hac_lag=args.hac_lag)
+        dm_ls = dm_test(A, B, key_cols=["target_quarter"], score_col="logscore", hac_lag=args.hac_lag)
+
+        dm_out = pd.concat([dm_crps.assign(model_A=mA, model_B=mB),
+                            dm_ls.assign(model_A=mA, model_B=mB)], ignore_index=True)
+        dm_out.to_csv(tab_dir / "dm_tests_final_before_release.csv", index=False)
+    else:
+        pd.DataFrame([{"note": "DM tests skipped (need >=2 models and density scores)."}]).to_csv(
+            tab_dir / "dm_tests_final_before_release.csv", index=False
+        )
+
+    # ----------------------------
+    # Figures: mean + density
+    # ----------------------------
     if not now.empty:
-        for model in sorted(now["model"].dropna().unique()):
-            fig_within_quarter_nowcast_paths(
-                now, model, fig_dir, ylab=ylab,
-                last_k_quarters=min(8, args.last_k_quarters)
-            )
-            fig_revision_paths_from_qstart_until_release(
-                now, model, fig_dir, ylab=ylab,
-                last_k_quarters=args.last_k_revision_quarters
-            )
-            fig_actual_vs_final_nowcast_over_time(
-                now, model, fig_dir, ylab=ylab,
-                last_k_quarters=args.last_k_quarters
-            )
-
-            # NEW: calendar date plots
+        for model in models:
+            # existing mean plots
+            fig_within_quarter_nowcast_paths(now, model, fig_dir, ylab=ylab, last_k_quarters=min(8, args.last_k_quarters))
+            fig_revision_paths_from_qstart_until_release(now, model, fig_dir, ylab=ylab, last_k_quarters=args.last_k_revision_quarters)
+            fig_actual_vs_final_nowcast_over_time(now, model, fig_dir, ylab=ylab, last_k_quarters=args.last_k_quarters)
             fig_all_nowcasts_calendar_current_target(now, model, fig_dir, ylab=ylab)
-            fig_all_nowcasts_calendar_by_target(
-                now, model, fig_dir, ylab=ylab,
-                last_k_quarters=args.last_k_quarters
-            )
+            fig_all_nowcasts_calendar_by_target(now, model, fig_dir, ylab=ylab, last_k_quarters=args.last_k_quarters)
 
+            # NEW density plots
+            fig_fan_chart_current_target(now, packs, model, fig_dir, ylab=ylab, display_units=args.display_units)
+            fig_density_heatmap_current_target(now, packs, model, fig_dir, ylab=ylab, display_units=args.display_units)
+
+            # PIT histograms
+            if "note" not in dens_cur.columns:
+                fig_pit_hist(dens_cur, model, fig_dir, title_suffix="current_quarter")
+            if "note" not in dens_final.columns:
+                fig_pit_hist(dens_final, model, fig_dir, title_suffix="final_before_release")
+
+    # ----------------------------
     # Index file
+    # ----------------------------
     index_lines = []
     index_lines.append(f"Run: {run_dir.name}")
     index_lines.append("")
@@ -957,6 +1370,10 @@ def main():
     index_lines.append("")
     index_lines.append("Nowcasts:")
     index_lines.append("  - nowcasts_with_actual_rw.csv (enriched + display-scale + rel-step + release_date)")
+    index_lines.append("")
+    index_lines.append("Density scoring notes:")
+    index_lines.append("  - Requires runs saved with posterior draws (SAVE_DRAWS=True).")
+    index_lines.append("  - Uses nowcast_draws_matrix + nowcast_targets from posterior.npz written by save_subrun_outputs().")
 
     (run_dir / "ARTIFACTS_INDEX.txt").write_text("\n".join(index_lines))
 

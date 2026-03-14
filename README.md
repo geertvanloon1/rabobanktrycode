@@ -98,6 +98,7 @@ The folder `src/zhangnowcast/` contains the building blocks of the model. The co
 
 ### Source tree
 
+
 src/zhangnowcast/
 ├── data/
 │   ├── data.py
@@ -188,3 +189,107 @@ These functions are mainly used by the run scripts to select the correct vintage
 **Summary of the data folder:**  
 The data folder starts from two inputs — a vintage file and `data/Spec_NL.xlsx` — and turns them into the `ZhangData` object that the samplers use. 
 
+
+
+### 2. Model blocks
+
+The files in `src/zhangnowcast/model/` implement the main model components. Together, they implement the factor dynamics, the GDP bridge equation, the factor-selection mechanism, the correlation structure in the stochastic-volatility model, and the state-space form of the bridge equation. These files do not run the full estimation themselves. Instead, they provide the model-specific building blocks that are called from the files in `inference/`.
+
+#### `factor_params.py`
+
+**Role:**  
+Updates the parameters of the factor state equation.
+
+**Main functions:**
+- `sample_a_sigma2(F, alpha_s, beta_s, rng)`  
+  Takes the current factor path `F` and samples the AR(1) persistence parameters `a` and the factor innovation variances `sigma2`.
+- `enforce_ident_order(F, Theta, a, sigma2, z, beta, p=None, s=None)`  
+  Reorders the factors and all associated parameter blocks so that the factor ordering remains consistent across iterations.
+
+**Model connection:**  
+This file corresponds to the factor dynamics in the model. The latent factors follow AR(1) processes, and this file updates the parameters that governs their persistence and innovation variance.
+
+**Code connection:**  
+The sampled `a` and `sigma2` are used later in `kalman_ffbs.py`, `bridging.py`, `sampler.py`, and `nowcast/nowcast.py`.
+
+---
+
+#### `gdp_block.py`
+
+**Role:**  
+Updates the parameters of the bridge equation that links monthly factors to quarterly GDP.
+
+**Main functions:**
+- `sample_beta_eta2(y_q, F, z, quarter_of_month, month_pos_in_quarter, eta2_current, ...)`  
+  Builds the quarterly bridge regression from the current factor path and samples the bridge coefficients `beta` and the GDP shock variance `eta2`.
+
+**Model connection:**  
+This file corresponds to the GDP bridge equation in the model. Quarterly GDP depends on the three monthly factor realizations within the quarter and on lagged GDP. When factor selection is active, the selected-factor vector `z` determines which factors enter the bridge equation.
+
+**Code connection:**  
+The sampled `beta` and `eta2` are used later in `bridging.py`, `sampler.py`, and `nowcast/nowcast.py`.
+
+---
+
+#### `selection.py`
+
+**Role:**  
+Implements the factor-selection mechanism that decides which candidate factors enter the model.
+
+**Main functions:**
+- `sample_z_p_pi(z, p, s, pi, loglik0, loglik1, ...)`  
+  Runs the full factor-selection step. It first updates the spike/slab indicators `s`, then updates the factor inclusion indicators `z` and the inclusion probabilities `p` for the factors that are in the slab, and finally updates `pi` by calling `mh_update_pi(...)`.
+- `mh_update_pi(pi, s_vec, alpha_pi, beta_pi, ...)`  
+  Carries out the Metropolis–Hastings step for π, the global sparsity parameter.
+
+**Model connection:**  
+This file corresponds to the factor-selection extension of the model. For each candidate factor, `z_j` determines whether that factor is included. The indicator `s_j` determines whether factor `j` is assigned to the spike or to the slab. The parameter π controls how strongly higher-indexed factors are penalized through the term `π^j`.
+
+**Code connection:**  
+`sampler.py` computes the likelihood contribution of setting `z_j = 0` or `z_j = 1` and passes those values into `sample_z_p_pi(...)`. The updated selection objects are then used in the GDP bridge equation and in the nowcast step.
+
+---
+#### `lkj_psi.py`
+
+**Role:**  
+Updates the correlation matrix `Psi` used in the stochastic-volatility version of the measurement equation.
+
+**Main functions:**
+- `propose_column_rw_LKJ1(Psi, i, step, rng)`  
+  Proposes a new row and column of the correlation matrix `Psi`.
+- `sample_Psi_LKJ1_columnwise_rw(Psi_current, loglik_fn, n_sweeps=1, step=0.05, rng=np.random)`  
+  Updates the full correlation matrix `Psi` column by column.
+
+**Model connection:**  
+This file belongs to the stochastic-volatility specification. In that version of the model, the idiosyncratic covariance matrix is decomposed into time-varying standard deviations and a constant correlation matrix `Psi`. This file updates that correlation matrix.
+
+**Code connection:**  
+`sampler.py` uses this file only when stochastic volatility is enabled. The updated `Psi` is then used together with the volatility states in the measurement covariance.
+
+---
+
+#### `bridging.py`
+
+**Role:**  
+Writes the quarterly GDP bridge equation in state-space form so that it can be combined with the monthly factor system.
+
+**Main classes and functions:**
+- `BridgeContext`  
+  Stores the current month, model parameters, quarter mapping, and GDP data needed for the bridge equation.
+- `BridgeObs`  
+  Stores the GDP observation equation at quarter end: the observed GDP value, the constant term, the loading vector, and the observation variance.
+- `GDPBridgeEq5.observe(ctx)`  
+  Checks whether the current month is the third month of a quarter and, if so, constructs the corresponding GDP observation equation.
+- `make_augmented_transition(a, sigma2, lag_count)`  
+  Builds the augmented transition matrix for the factor state `[F_t, F_{t-1}, F_{t-2}]`.
+
+**Model connection:**  
+It allows quarterly GDP to enter the same state-space system as the monthly factors.
+
+**Code connection:**  
+`kalman_ffbs.py` uses `BridgeContext`, `GDPBridgeEq5`, and `make_augmented_transition(...)` when sampling the latent factors. This file connects the factor dynamics from `factor_params.py` and the GDP bridge parameters from `gdp_block.py` to the joint state-space system used in estimation.
+
+---
+
+**Summary of the model folder:**  
+The `model/` folder contains the main model-specific building blocks. `factor_params.py` updates the factor dynamics, `gdp_block.py` updates the GDP bridge equation, `selection.py` updates the factor-selection structure, `lkj_psi.py` updates the correlation matrix in the stochastic-volatility model, and `bridging.py` writes the GDP bridge equation in a form that can be used inside the latent-state estimation step. The files in `inference/` call these blocks and combine them into the full estimation procedure.

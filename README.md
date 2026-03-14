@@ -98,7 +98,6 @@ The folder `src/zhangnowcast/` contains the building blocks of the model. The co
 
 ### Source tree
 
-```text
 src/zhangnowcast/
 ├── data/
 │   ├── data.py
